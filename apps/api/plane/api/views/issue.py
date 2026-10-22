@@ -49,6 +49,7 @@ from plane.api.serializers import (
     IssueRelationCreateSerializer,
     IssueRelationResponseSerializer,
     IssueRelationSerializer,
+    IssueRelationRemoveSerializer,
     IssueSerializer,
     LabelSerializer,
     IssueAttachmentUploadSerializer,
@@ -2587,3 +2588,69 @@ class IssueRelationListCreateAPIEndpoint(BaseAPIView):
             serializer_class(refetched_relations, many=True).data,
             status=status.HTTP_201_CREATED,
         )
+
+
+class IssueRelationRemoveAPIEndpoint(BaseAPIView):
+    """Issue Relation Remove Endpoint"""
+
+    serializer_class = IssueRelationRemoveSerializer
+    model = IssueRelation
+    permission_classes = [ProjectEntityPermission]
+
+    @work_item_relation_docs(
+        operation_id="remove_work_item_relation",
+        summary="Remove a work item relation",
+        description="Remove the relation between a work item and a related work item.",
+        parameters=[ISSUE_ID_PARAMETER],
+        request=IssueRelationRemoveSerializer,
+        responses={
+            204: OpenApiResponse(description="Relation removed"),
+            400: INVALID_REQUEST_RESPONSE,
+            404: ISSUE_NOT_FOUND_RESPONSE,
+        },
+    )
+    def post(self, request, slug, project_id, issue_id):
+        serializer = IssueRelationRemoveSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        related_issue_id = serializer.validated_data["related_issue"]
+
+        # Scope the URL work item to this project before touching any relation.
+        if not Issue.objects.filter(id=issue_id, project_id=project_id, workspace__slug=slug).exists():
+            return Response({"error": "Work item not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        relations = list(
+            IssueRelation.objects.filter(
+                Q(issue_id=issue_id, related_issue_id=related_issue_id)
+                | Q(issue_id=related_issue_id, related_issue_id=issue_id),
+                workspace__slug=slug,
+            ).select_related("issue__state", "related_issue__state")
+        )
+
+        if not relations:
+            return Response({"error": "Work item relation not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        epoch = int(timezone.now().timestamp())
+        for relation in relations:
+            # The activity task reads the other side of the relation, so send the
+            # counterpart of the work item in the URL, not the stored issue_id.
+            related_issue = relation.related_issue_id if str(relation.issue_id) == str(issue_id) else relation.issue_id
+            current_instance = json.dumps(IssueRelationSerializer(relation).data, cls=DjangoJSONEncoder)
+            relation.delete()
+            issue_activity.delay(
+                type="issue_relation.activity.deleted",
+                requested_data=json.dumps(
+                    {"related_issue": str(related_issue), "relation_type": relation.relation_type},
+                    cls=DjangoJSONEncoder,
+                ),
+                actor_id=str(request.user.id),
+                issue_id=str(issue_id),
+                project_id=str(project_id),
+                current_instance=current_instance,
+                epoch=epoch,
+                notification=True,
+                origin=base_host(request=request, is_app=True),
+            )
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
